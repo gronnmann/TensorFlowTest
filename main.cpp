@@ -181,7 +181,7 @@ vector< std::string > getClassNames(const std::string& imagenet_classes)
     std::vector< std::string > classes;
     if (!classes_file.good())
     {
-        std::cerr << "ERROR: can't read file with classes names.n";
+        std::cerr << "ERROR: can't read file with class names";
         return classes;
     }
     std::string class_name;

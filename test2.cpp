@@ -21,6 +21,7 @@ static TestLogger logger;
 
 void uploadToBuffer(cv::Mat &img, float *gpu_input, const Dims dims, bool showImg);
 void postprocessAndDisplay(cv::Mat &img, float *gpu_output, const Dims dims, float treshold);
+vector< std::string > getClassNames(const std::string& imagenet_classes);
 
 // Usage - ./TensorFlowTest {engine file}.engine {image file}.jpg
 int main(int argc, char* argv[]) {
@@ -31,9 +32,9 @@ int main(int argc, char* argv[]) {
 
     std::string model_path(argv[1]);
     std::string image_path(argv[2]);
-
-    std::ifstream opened_file_stream;
-    opened_file_stream.open(model_path);
+    // Remember to load as binary
+    std::ifstream opened_file_stream(model_path, std::ios::in | std::ios::binary);
+//    opened_file_stream.open(model_path);
 
     std::printf("Loading network from %s\n", model_path.c_str());
 
@@ -165,61 +166,114 @@ void uploadToBuffer(cv::Mat &img, float *gpu_input, const Dims dims, bool showIm
 // https://github.com/enazoe/yolo-tensorrt/blob/master/modules/yolo.h
 // PLS HJELP
 
-void postprocessAndDisplay(cv::Mat &img, float *gpu_output, const Dims dims, float treshold){
+void postprocessAndDisplay(cv::Mat &img, float *gpu_output, const Dims dims, float threshold){
     // Copy to CPU
     size_t dimsSize = accumulate(dims.d+1, dims.d+dims.nbDims, 1, multiplies<size_t>());
     vector<float> cpu_output (dimsSize);
 
     cudaMemcpy(cpu_output.data(), gpu_output, cpu_output.size()*sizeof(float), cudaMemcpyDeviceToHost);
 
-    vector<int> classIds, indices;
+    vector<int> classIds;
     vector<cv::Rect> boxes, boxesNMS;
     vector<float> confidences;
 
-    int img_width = img.cols;
-    int img_height = img.rows;
+    /*
+     * YOLOv5 Network outputs a 1x25200x85 tensor
+     *
+     * 25200 are all the box guesses (with probably shitty confidence for most of them)
+     * 85 are the following:
+     *  - x
+     *  - y
+     *  - width
+     *  - height
+     *  - scores for indiviudal classes (in test model - 80 for COCO)
+     *
+     * Thanks to https://stackoverflow.com/questions/74226690/tensorrt-finding-boundin-box-data-after-inference/74233108#74233108
+     */
 
-    int n_boxes = dims.d[1], n_classes = dims.d[2];
+    int n_boxes = dims.d[1];
+    int n_data = dims.d[2];
 
-//    printf("Image size: %i x %i, n_boxes: %i, n_classes: %i\n", img_width, img_height, n_boxes, n_classes);
+    int img_w = img.cols;
+    int img_h = img.rows;
+
+    vector<string> class_names = getClassNames("../classes.txt"); // TODO - Placeholder
 
     for (int i = 0; i < n_boxes; i++){
+        int offset = i * n_data;
 
-        uint32_t maxClass = 0;
-        float maxScore = -1000.0f;
+        const float w = cpu_output[offset + 2];
+        const float h = cpu_output[offset + 3];
+        // Go from x-mid to x, y-mid to y
+        const float x = cpu_output[offset + 0] - w/2;
+        const float y = cpu_output[offset + 1] - h/2;
 
-        for (int j = 1; j < n_classes; j++){ // Starte paa 1 sia 0 er himmelen???
-            float score = cpu_output[i * n_classes + j];
+        const float confidence = cpu_output[offset + 4];
 
-//            printf("Confidence found %f\n", score);
+        if (confidence < threshold)continue;
 
-            if (score < treshold)continue;
+        int max_class = 1;
+        float max_class_score = -1.0f;
 
-            if (score > maxScore){
-                maxScore = score;
-                maxClass = j;
+        for (int j = 0; j < n_data-5; j++){
+            float class_score = cpu_output[offset + 5 + j];
+
+            if (class_score > max_class_score){
+                max_class_score = class_score;
+                max_class = j;
             }
         }
 
-//        printf("Max score for %i, class %i: %f\n", i, maxClass , maxScore);
-        if (maxScore > treshold){
-            float left_raw = (cpu_output[4*i]);
-            float top_raw = (cpu_output[4*i + 1]);
-            float right_raw = (cpu_output[4*i + 2]);
-            float bottom_raw = (cpu_output[4*i + 3]);
-//            int width = right - left + 1;
-//            int height = bottom - top + 1;
-//
-//            cv::rectangle(img, cv::Rect(left, top, width, height), cv::Scalar(255, 0, 0), 1);
+        float multiplier_norm_x = ((float)img_w)/640;
+        float multiplier_norm_y = ((float)img_h)/640;
+        float x_norm = x * multiplier_norm_x;
+        float y_norm = y * multiplier_norm_y;
+        float w_norm = w * multiplier_norm_x;
+        float h_norm = h * multiplier_norm_y;
 
-//            printf("Drawing rectangle at: %f %f %f %f\n", left_raw, top_raw, right_raw, bottom_raw);
+        printf("Found box of %s (%i) with conf=%f at %f %f %f %f\n", class_names[max_class].c_str() , max_class, confidence, x, y, w, h);
 
-            //printf("Found class %i\n", maxClass);
-        }
+
+
+        cv::Rect box = cv::Rect((int)(x_norm), (int)(y_norm), (int)(w_norm), (int)(h_norm));
+
+
+        boxes.emplace_back(box);
+        confidences.emplace_back(confidence);
     }
 
+    std::vector<int> filtered;
+    cv::dnn::NMSBoxes(boxes, confidences, threshold, threshold, filtered);
 
-    cv::resize(img, img, cv::Size(1000, 1000));
-//    cv::imshow("Test", img);
-//    cv::waitKey(0);
+    vector<float> confidencesNMS(filtered.size());
+    for (int i = 0; i < filtered.size(); i++){
+        confidencesNMS.emplace_back(confidences[filtered[i]]);
+        boxesNMS.emplace_back(boxes[filtered[i]]);
+
+        cv::rectangle(img, boxes[filtered[i]],cv::Scalar(0, 0, 255));
+    }
+
+//    cv::resize(img, img, cv::Size(1000, 1000));
+    cv::imshow("Test", img);
+    cv::waitKey(0);
+}
+
+vector< std::string > getClassNames(const std::string& imagenet_classes)
+{
+    std::ifstream classes_file(imagenet_classes);
+    std::vector< std::string > classes;
+    if (!classes_file.good())
+    {
+        std::cerr << "ERROR: can't read file with class names";
+        return classes;
+    }
+    std::string class_name;
+    cout << "Loading class: ";
+    while (std::getline(classes_file, class_name))
+    {
+        classes.push_back(class_name);
+        cout << class_name << ", ";
+    }
+    cout << std::endl;
+    return classes;
 }
