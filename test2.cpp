@@ -20,8 +20,18 @@ static TestLogger logger;
 
 
 void uploadToBuffer(cv::Mat &img, float *gpu_input, const Dims dims, bool showImg);
-void postprocessAndDisplay(cv::Mat &img, float *gpu_output, const Dims dims, float treshold);
+void postprocessAndDisplay(cv::Mat &img, float *gpu_output, const Dims dims, float threshold, float nms_threshold);
 vector< std::string > getClassNames(const std::string& imagenet_classes);
+
+cv::Scalar diffColors[] = {
+        cv::Scalar(255, 0, 0),
+        cv::Scalar(255, 255, 0),
+        cv::Scalar(0, 255, 0),
+        cv::Scalar(0, 0, 255),
+        cv::Scalar(0, 255, 255),
+        cv::Scalar(255, 0, 255),
+};
+
 
 // Usage - ./TensorFlowTest {engine file}.engine {image file}.jpg
 int main(int argc, char* argv[]) {
@@ -119,8 +129,7 @@ int main(int argc, char* argv[]) {
 
     // PART 3 - CHECK OUTPUT
 
-
-    postprocessAndDisplay(img, (float*)buffers[1], output, 0.5);
+    postprocessAndDisplay(img, (float*)buffers[1], output, 0.25, 0.45);
 
     cudaFree(buffers);
 
@@ -129,6 +138,8 @@ int main(int argc, char* argv[]) {
 void uploadToBuffer(cv::Mat &img, float *gpu_input, const Dims dims, bool showImg){
     // Do scaling on GPU
     cv::cuda::GpuMat gpu_frame;
+
+    cv::cvtColor(img, img, cv::COLOR_BGR2RGB);
     gpu_frame.upload(img);
 
     int32_t input_width = dims.d[3];
@@ -139,7 +150,7 @@ void uploadToBuffer(cv::Mat &img, float *gpu_input, const Dims dims, bool showIm
     printf("Loading and resizing image. Tensor dimensions = %ix%i, channels: %i\n", input_width, input_height, input_channels);
     cv::cuda::GpuMat resized;
     cv::cuda::resize(gpu_frame, resized, cv::Size(input_width, input_height),
-                     0, 0, cv::INTER_NEAREST);
+                     0, 0, cv::INTER_LINEAR);
 
     cv::cuda::GpuMat flt_img;
     resized.convertTo(flt_img, CV_32FC3, 1.f/255.f);
@@ -149,13 +160,13 @@ void uploadToBuffer(cv::Mat &img, float *gpu_input, const Dims dims, bool showIm
      * IMAGENET_MEAN = 0.485, 0.456, 0.406  # RGB mean
      * IMAGENET_STD = 0.229, 0.224, 0.225  # RGB standard deviation
      */
-    cv::cuda::subtract(flt_img, cv::Scalar(0.406f, 0.456f, 0.485f), flt_img, cv::noArray(), -1);
-    cv::cuda::divide(flt_img, cv::Scalar(0.225f, 0.224f, 0.229f), flt_img, 1, -1);
+//    cv::cuda::subtract(flt_img, cv::Scalar(0.406f, 0.456f, 0.485f), flt_img, cv::noArray(), -1);
+//    cv::cuda::divide(flt_img, cv::Scalar(0.225f, 0.224f, 0.229f), flt_img, 1, -1);
 
     // To tensor
     vector<cv::cuda::GpuMat> channels;
     for (int i = 0; i < input_channels; i++){
-        cv::cuda::GpuMat split = cv::cuda::GpuMat(cv::Size(input_width, input_height), CV_32FC1, gpu_input + i* input_width * input_height);
+        cv::cuda::GpuMat split = cv::cuda::GpuMat(cv::Size(input_width, input_height), CV_32FC1, gpu_input + i * input_width * input_height);
         channels.emplace_back(split);
     }
     cv::cuda::split(flt_img, channels);
@@ -166,7 +177,7 @@ void uploadToBuffer(cv::Mat &img, float *gpu_input, const Dims dims, bool showIm
 // https://github.com/enazoe/yolo-tensorrt/blob/master/modules/yolo.h
 // PLS HJELP
 
-void postprocessAndDisplay(cv::Mat &img, float *gpu_output, const Dims dims, float threshold){
+void postprocessAndDisplay(cv::Mat &img, float *gpu_output, const Dims dims, float threshold, float nms_threshold){
     // Copy to CPU
     size_t dimsSize = accumulate(dims.d+1, dims.d+dims.nbDims, 1, multiplies<size_t>());
     vector<float> cpu_output (dimsSize);
@@ -237,25 +248,40 @@ void postprocessAndDisplay(cv::Mat &img, float *gpu_output, const Dims dims, flo
 
         cv::Rect box = cv::Rect((int)(x_norm), (int)(y_norm), (int)(w_norm), (int)(h_norm));
 
+        cv::rectangle(img, box ,cv::Scalar(255, 255, 255), 1);
+//        cv::Point text_point = cv::Point(box.x + 15,box.y + 50);
+//        cv::putText(img, "car (" + to_string(confidence) + ")", text_point,
+//                    cv::FONT_HERSHEY_COMPLEX, 1, cv::Scalar(0, 0, 00255));
 
         boxes.emplace_back(box);
         confidences.emplace_back(confidence);
+        classIds.emplace_back(max_class);
     }
 
     std::vector<int> filtered;
-    cv::dnn::NMSBoxes(boxes, confidences, threshold, threshold, filtered);
+    cv::dnn::NMSBoxes(boxes, confidences, threshold, nms_threshold, filtered);
 
     vector<float> confidencesNMS(filtered.size());
     for (int i = 0; i < filtered.size(); i++){
         confidencesNMS.emplace_back(confidences[filtered[i]]);
-        boxesNMS.emplace_back(boxes[filtered[i]]);
 
-        cv::rectangle(img, boxes[filtered[i]],cv::Scalar(0, 0, 255));
+        cv::Rect box = boxes[filtered[i]];
+        boxesNMS.emplace_back(box);
+
+        cv::Scalar color_to_use = diffColors[ classIds[filtered[i]] % (sizeof(diffColors)/sizeof(diffColors[0]))];
+
+        cv::rectangle(img, box,color_to_use, 10);
+        cv::Point text_point = cv::Point(box.x,box.y - 20);
+        cv::putText(img, class_names[classIds[filtered[i]]] + " (" + to_string(confidences[filtered[i]]) + ")", text_point,
+                    cv::FONT_HERSHEY_TRIPLEX, 1.5, color_to_use);
     }
 
+    cv::imwrite("inferenced.jpg", img);
+
 //    cv::resize(img, img, cv::Size(1000, 1000));
-    cv::imshow("Test", img);
-    cv::waitKey(0);
+//    cv::imshow("Test", img);
+//    cv::waitKey(0);
+
 }
 
 vector< std::string > getClassNames(const std::string& imagenet_classes)
