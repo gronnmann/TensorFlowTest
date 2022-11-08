@@ -1,5 +1,6 @@
 #include <iostream>
 #include <NvInfer.h>
+#include <NvOnnxParser.h>
 #include <cuda_runtime.h>
 #include <fstream>
 #include <memory>
@@ -21,6 +22,10 @@ static TestLogger logger;
 
 void uploadToBuffer(cv::Mat &img, float *gpu_input, const Dims dims, bool showImg);
 void postprocessAndDisplay(cv::Mat &img, float *gpu_output, const Dims dims, float threshold, float nms_threshold);
+bool loadEngine(ICudaEngine** engine, string& model_name);
+bool loadONNX(ICudaEngine** engine, string& onnx_path, string saved_name);
+
+
 vector< std::string > getClassNames(const std::string& imagenet_classes);
 
 cv::Scalar diffColors[] = {
@@ -36,50 +41,55 @@ cv::Scalar diffColors[] = {
 // Usage - ./TensorFlowTest {engine file}.engine {image file}.jpg
 int main(int argc, char* argv[]) {
     if (argc < 3) {
-        std::cerr << "usage: " << argv[0] << " model.engine image.jpgn\n";
+        std::cerr << "usage: " << argv[0] << " model.engine/onnx image.jpg useOnnx\n";
         return -1;
     }
 
     std::string model_path(argv[1]);
     std::string image_path(argv[2]);
-    // Remember to load as binary
-    std::ifstream opened_file_stream(model_path, std::ios::in | std::ios::binary);
+    std::string useOnnx(argv[3]);
+
+//    // Remember to load as binary
+//    std::ifstream opened_file_stream(model_path, std::ios::in | std::ios::binary);
 //    opened_file_stream.open(model_path);
-
-    std::printf("Loading network from %s\n", model_path.c_str());
-
-
-    // Check netowrk size
-    opened_file_stream.seekg(0, std::ios::end);
-    const int model_size = opened_file_stream.tellg();
-    opened_file_stream.seekg(0, std::ios::beg);
-
-    std::printf("Model size is %d\n", model_size);
-
-    void* model_mem = malloc(model_size);
-    if (!model_mem){
-        std::printf("Failed to allocate %i bytes to deserialize model\n", model_size);
-    }
-    opened_file_stream.read((char*)model_mem, model_size);
+//
+//    std::printf("Loading network from %s\n", model_path.c_str());
+//
+//
+//    // Check netowrk size
+//    opened_file_stream.seekg(0, std::ios::end);
+//    const int model_size = opened_file_stream.tellg();
+//    opened_file_stream.seekg(0, std::ios::beg);
+//
+//    std::printf("Model size is %d\n", model_size);
+//
+//    void* model_mem = malloc(model_size);
+//    if (!model_mem){
+//        std::printf("Failed to allocate %i bytes to deserialize model\n", model_size);
+//    }
+//    opened_file_stream.read((char*)model_mem, model_size);
 
 
     //SECTION 1 - Creating CUDA Engine and loading .engine file | Works
 
     ICudaEngine* engine = nullptr;
-    IRuntime* runtime = createInferRuntime(logger);
 
-    engine = runtime->deserializeCudaEngine(model_mem, model_size);
+//    string saved_name = "parsed_yolov5l.engine";
+//    bool loadModel = loadONNX(engine, model_path, saved_name);
 
-    if (!engine){
+    bool loadModel = false;
+    if (useOnnx == "true"){
+        cout << "Parsing onnx model\n";
+        loadModel = loadONNX(&engine, model_path, "auto.engine");
+    }else{
+        loadModel = loadEngine(&engine, model_path);
+    }
+
+    if (!loadModel){
         cout << "Engine creation failed\n";
         return 1;
     }
-
     printf("Engine takes in %i tensors.\n", engine->getNbBindings());
-
-    // Free memory
-    delete runtime;
-    free(model_mem);
 
     // SECTION 2 - Create dimension data
 
@@ -134,6 +144,100 @@ int main(int argc, char* argv[]) {
     cudaFree(buffers);
 
 }
+
+bool loadEngine(ICudaEngine** engine, string& model_path){
+    std::ifstream opened_file_stream(model_path, std::ios::in | std::ios::binary);
+//    opened_file_stream.open(model_path);
+
+    std::printf("Loading network from %s\n", model_path.c_str());
+
+
+    // Check netowrk size
+    opened_file_stream.seekg(0, std::ios::end);
+    const int model_size = opened_file_stream.tellg();
+    opened_file_stream.seekg(0, std::ios::beg);
+
+    std::printf("Model size is %d\n", model_size);
+
+    void* model_mem = malloc(model_size);
+    if (!model_mem){
+        std::printf("Failed to allocate %i bytes to deserialize model\n", model_size);
+    }
+    opened_file_stream.read((char*)model_mem, model_size);
+
+
+    //SECTION 1 - Creating CUDA Engine and loading .engine file | Works
+
+    IRuntime* runtime = createInferRuntime(logger);
+
+
+    //// Crashes here for some reason
+    *engine = runtime->deserializeCudaEngine(model_mem, model_size);
+
+    if (!*engine){
+        cout << "Engine creation failed\n";
+        return false;
+    }
+
+
+    delete runtime;
+    free(model_mem);
+
+    return true;
+}
+bool loadONNX(ICudaEngine** engine, string& onnx_path, string saved_name){
+    IBuilder* builder = createInferBuilder(logger);
+
+    //idk what it does but is in nvidia
+    uint32_t flag = 1U <<static_cast<uint32_t>
+    (NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
+
+    INetworkDefinition* network = builder->createNetworkV2(flag);
+
+    nvonnxparser::IParser* parser = nvonnxparser::createParser(*network, logger);
+
+    bool success = parser->parseFromFile(onnx_path.c_str(),
+                                         static_cast<int32_t>(ILogger::Severity::kINFO));
+
+    if (!success){
+        cout << "Failed to parse onnx from file " << onnx_path << "\n";
+        return false;
+    }
+
+    IBuilderConfig* config = builder->createBuilderConfig();
+    // 4 GB
+    config->setMemoryPoolLimit(MemoryPoolType::kWORKSPACE, (4 * 1U) << 20);
+
+//    IOptimizationProfile* profile = builder->createOptimizationProfile();
+//    //Model 1x 3 channels x size
+//    profile->setDimensions("input", OptProfileSelector::kMAX, Dims4(1, 3, 640, 640));
+//    profile->setDimensions("input", OptProfileSelector::kMIN, Dims4(1, 3, 640, 640));
+//    profile->setDimensions("input", OptProfileSelector::kOPT, Dims4(1, 3, 640, 640));
+//    config->addOptimizationProfile(profile);
+
+    IHostMemory* serializedModel = builder->buildSerializedNetwork(*network, *config);
+
+    ofstream write_out(saved_name, ios::binary);
+    write_out.write((const char*) serializedModel->data(), serializedModel->size());
+    write_out.close();
+
+
+    IRuntime* runtime = createInferRuntime(logger);
+    *engine = runtime->deserializeCudaEngine(serializedModel->data(), serializedModel->size());
+    if (!*engine){
+        cout << "Engine file creation failed\n";
+        return false;
+    }
+
+    delete parser;
+    delete network;
+    delete config;
+    delete builder;
+    delete runtime;
+
+    return true;
+}
+
 
 void uploadToBuffer(cv::Mat &img, float *gpu_input, const Dims dims, bool showImg){
     // Do scaling on GPU
@@ -208,7 +312,7 @@ void postprocessAndDisplay(cv::Mat &img, float *gpu_output, const Dims dims, flo
     int img_w = img.cols;
     int img_h = img.rows;
 
-    vector<string> class_names = getClassNames("../classes.txt"); // TODO - Placeholder
+    vector<string> class_names = getClassNames("./classes.txt"); // TODO - Placeholder
 
     for (int i = 0; i < n_boxes; i++){
         int offset = i * n_data;
@@ -275,7 +379,7 @@ void postprocessAndDisplay(cv::Mat &img, float *gpu_output, const Dims dims, flo
         cv::putText(img, class_names[classIds[filtered[i]]] + " (" + to_string(confidences[filtered[i]]) + ")", text_point,
                     cv::FONT_HERSHEY_TRIPLEX, 1.5, color_to_use);
     }
-
+    cv::cvtColor(img, img, cv::COLOR_RGB2BGR);
     cv::imwrite("inferenced.jpg", img);
 
 //    cv::resize(img, img, cv::Size(1000, 1000));
