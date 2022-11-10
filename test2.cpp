@@ -9,8 +9,10 @@
 #include <opencv2/core/cuda.hpp>
 #include <opencv2/cudawarping.hpp>
 #include <opencv2/cudaarithm.hpp>
+#include <opencv2/cudaimgproc.hpp>
 #include <numeric>
 #include "tensorrt_utils.h"
+#include <chrono>
 
 using namespace std;
 using namespace nvinfer1;
@@ -20,8 +22,10 @@ static TestLogger logger;
 // Good example code - https://github.com/NVIDIA-developer-blog/code-samples/blob/master/posts/TensorRT-introduction/simpleOnnx.cpp
 
 
-void uploadToBuffer(cv::Mat &img, float *gpu_input, const Dims dims, bool showImg);
-void postprocessAndDisplay(cv::Mat &img, float *gpu_output, const Dims dims, float threshold, float nms_threshold);
+void uploadToBuffer(cv::Mat &img, float *gpu_input, const Dims dims);
+void uploadToBuffer(cv::Mat &img, float *gpu_input, int32_t input_width, int32_t input_height, int32_t input_channels);
+
+void postprocessAndDisplay(cv::Mat &img, float *gpu_output, const Dims dims, vector<string> class_names, float threshold, float nms_threshold);
 bool loadEngine(ICudaEngine** engine, string& model_name);
 bool loadONNX(ICudaEngine** engine, string& onnx_path, string saved_name);
 
@@ -128,18 +132,37 @@ int main(int argc, char* argv[]) {
     Dims input = engine->getBindingDimensions(inputIndex);
     Dims output = engine->getBindingDimensions(outputIndex);
 
+    vector<string> class_names = getClassNames("./classes.txt"); // TODO - Placeholder
+
+    int32_t input_width = input.d[3];
+    int32_t input_height = input.d[2];
+    int32_t input_channels = input.d[1];
 
 
-    uploadToBuffer(img, (float*)buffers[0], input, true);
+    auto point1 = chrono::high_resolution_clock::now();
+    uploadToBuffer(img, (float*)buffers[0], input_width, input_height, input_channels);
+
+    auto point2 = chrono::high_resolution_clock::now();
 
     // PART 3 - DO INFERENCE
     bool inferenceSuccessful = context->executeV2(buffers);
-    printf("Done inference. Success: %i\n", inferenceSuccessful);
-    printf("Output dimensions: %ix%ix%i, %i dimensions\n", output.d[0], output.d[1], output.d[2], output.nbDims);
+    auto point3 = chrono::high_resolution_clock::now();
 
     // PART 3 - CHECK OUTPUT
 
-    postprocessAndDisplay(img, (float*)buffers[1], output, 0.25, 0.45);
+    postprocessAndDisplay(img, (float*)buffers[1], output, class_names, 0.25, 0.45);
+    auto point4 = chrono::high_resolution_clock::now();
+
+    printf("Done inference. Success: %i\n", inferenceSuccessful);
+    printf("Output dimensions: %ix%ix%i, %i dimensions\n", output.d[0], output.d[1], output.d[2], output.nbDims);
+
+
+    chrono::milliseconds durationPreprocess = chrono::duration_cast<chrono::milliseconds>(point2 - point1);
+    chrono::milliseconds durationInference = chrono::duration_cast<chrono::milliseconds>(point3 - point2);
+    chrono::milliseconds durationPostprocess = chrono::duration_cast<chrono::milliseconds>(point4 - point3);
+    chrono::milliseconds durationTotal = chrono::duration_cast<chrono::milliseconds>(point4 - point1);
+    cout << "Timings:\n preprocessing " << durationPreprocess.count() << " ms\n inference " << durationInference.count() << " ms\n postprocess " << durationPostprocess.count() << " ms \n"
+        << "total " << durationTotal.count() << " ms\n";
 
     cudaFree(buffers);
 
@@ -238,23 +261,30 @@ bool loadONNX(ICudaEngine** engine, string& onnx_path, string saved_name){
     return true;
 }
 
-
-void uploadToBuffer(cv::Mat &img, float *gpu_input, const Dims dims, bool showImg){
-    // Do scaling on GPU
-    cv::cuda::GpuMat gpu_frame;
-
-    cv::cvtColor(img, img, cv::COLOR_BGR2RGB);
-    gpu_frame.upload(img);
-
+void uploadToBuffer(cv::Mat &img, float *gpu_input, const Dims dims){
     int32_t input_width = dims.d[3];
     int32_t input_height = dims.d[2];
     int32_t input_channels = dims.d[1];
+
+    uploadToBuffer(img, gpu_input, input_width, input_height, input_channels);
+}
+
+void uploadToBuffer(cv::Mat &img, float *gpu_input, int32_t input_width, int32_t input_height, int32_t input_channels){
+    // Do scaling on GPU
+    cv::cuda::GpuMat gpu_frame;
+
+    gpu_frame.upload(img);
+
 //    cv::Size_<int> input_size = cv::Size(input_width, input_height);
 
     printf("Loading and resizing image. Tensor dimensions = %ix%i, channels: %i\n", input_width, input_height, input_channels);
     cv::cuda::GpuMat resized;
     cv::cuda::resize(gpu_frame, resized, cv::Size(input_width, input_height),
                      0, 0, cv::INTER_LINEAR);
+    // BGR to RGB
+    cv::cuda::cvtColor(resized, resized, cv::COLOR_BGR2RGB);
+
+
 
     cv::cuda::GpuMat flt_img;
     resized.convertTo(flt_img, CV_32FC3, 1.f/255.f);
@@ -281,7 +311,7 @@ void uploadToBuffer(cv::Mat &img, float *gpu_input, const Dims dims, bool showIm
 // https://github.com/enazoe/yolo-tensorrt/blob/master/modules/yolo.h
 // PLS HJELP
 
-void postprocessAndDisplay(cv::Mat &img, float *gpu_output, const Dims dims, float threshold, float nms_threshold){
+void postprocessAndDisplay(cv::Mat &img, float *gpu_output, const Dims dims, vector<string> class_names, float threshold, float nms_threshold){
     // Copy to CPU
     size_t dimsSize = accumulate(dims.d+1, dims.d+dims.nbDims, 1, multiplies<size_t>());
     vector<float> cpu_output (dimsSize);
@@ -311,8 +341,6 @@ void postprocessAndDisplay(cv::Mat &img, float *gpu_output, const Dims dims, flo
 
     int img_w = img.cols;
     int img_h = img.rows;
-
-    vector<string> class_names = getClassNames("./classes.txt"); // TODO - Placeholder
 
     for (int i = 0; i < n_boxes; i++){
         int offset = i * n_data;
@@ -364,7 +392,6 @@ void postprocessAndDisplay(cv::Mat &img, float *gpu_output, const Dims dims, flo
 
     std::vector<int> filtered;
     cv::dnn::NMSBoxes(boxes, confidences, threshold, nms_threshold, filtered);
-
     vector<float> confidencesNMS(filtered.size());
     for (int i = 0; i < filtered.size(); i++){
         confidencesNMS.emplace_back(confidences[filtered[i]]);
